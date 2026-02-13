@@ -31,32 +31,32 @@ static const uint32_t CONSENSUS_HOLD_MS = 180000; // 3 minutes
 // Format: Orb N -> GPIO (Header pin # from IMG_7712)
 static const int ORB_PINS[15] = {
   -1,        // index 0 unused
-  13,        // Orb 1  -> GPIO13 (top header pin 12)
-  14,        // Orb 2  -> GPIO14 (top header pin 10)
-  16,        // Orb 3  -> GPIO16 (bottom header pin 27)
-  17,        // Orb 4  -> GPIO17 (bottom header pin 28)
-  18,        // Orb 5  -> GPIO18 (bottom header pin 30)
-  19,        // Orb 6  -> GPIO19 (bottom header pin 32)
-  21,        // Orb 7  -> GPIO21 (bottom header pin 33)
-  22,        // Orb 8  -> GPIO22 (bottom header pin 36)
-  23,        // Orb 9  -> GPIO23 (bottom header pin 37)
-  25,        // Orb 10 -> GPIO25 (top header pin 7)
-  26,        // Orb 11 -> GPIO26 (top header pin 8)
-  27,        // Orb 12 -> GPIO27 (top header pin 9)
-  32,        // Orb 13 -> GPIO32 (top header pin 5)
-  33         // Orb 14 -> GPIO33 (top header pin 6)
+  13,        // Orb 1  -> GPIO13 (header pin 15)
+  14,        // Orb 2  -> GPIO14 (header pin 12)
+  16,        // Orb 3  -> GPIO16 (header pin 27)
+  17,        // Orb 4  -> GPIO17 (header pin 28)
+  18,        // Orb 5  -> GPIO18 (header pin 30)
+  19,        // Orb 6  -> GPIO19 (header pin 31)
+  21,        // Orb 7  -> GPIO21 (header pin 33)
+  22,        // Orb 8  -> GPIO22 (header pin 36)
+  23,        // Orb 9  -> GPIO23 (header pin 37)
+  25,        // Orb 10 -> GPIO25 (header pin 9)
+  26,        // Orb 11 -> GPIO26 (header pin 10)
+  27,        // Orb 12 -> GPIO27 (header pin 11)
+  32,        // Orb 13 -> GPIO32 (header pin 7)
+  33         // Orb 14 -> GPIO33 (header pin 8)
 };
 
 // "ALL ORBS == 15" pin (GPIO number):
 // Active when all 14 nodes report last_color == TRIGGER_COLOR.
-static const int ALL_ORBS_PIN = 4; // GPIO4 (bottom header pin 26)
+static const int ALL_ORBS_PIN = 4; // GPIO4 (header pin 26)
 
 // Trigger color
 static const int32_t TRIGGER_COLOR = 15;
 
-// Outputs are active-low: LOW = active, HIGH = inactive
-static const uint8_t PIN_ACTIVE_LEVEL = LOW;
-static const uint8_t PIN_INACTIVE_LEVEL = HIGH;
+// Outputs are active-high: HIGH = active, LOW = inactive
+static const uint8_t PIN_ACTIVE_LEVEL = HIGH;
+static const uint8_t PIN_INACTIVE_LEVEL = LOW;
 
 // ==================== PROTOCOL ====================
 enum MsgType : uint8_t {
@@ -68,7 +68,8 @@ enum MsgType : uint8_t {
   MSG_ACK       = 6,
   MSG_LIGHT     = 7,  // value = 1 if pink, 0 otherwise (only on pink transitions)
   MSG_CONSENSUS = 8,  // value = 1 if all 14 orbs are pink, 0 otherwise
-  MSG_IR_FUNC   = 9   // value = 1:ON, 2:OFF, 3:FLASH, 4:STROBE
+  MSG_IR_FUNC   = 9,  // value = 1:ON, 2:OFF, 3:FLASH, 4:STROBE
+  MSG_CYCLE_CFG = 10  // value packed as: [count:4][idx0:4][idx1:4][idx2:4][idx3:4][idx4:4][idx5:4]
 };
 
 #pragma pack(push, 1)
@@ -272,7 +273,7 @@ static void setTriggerTargetsActive(const String& target, bool active) {
   if (target == "all") {
     setAllPinsActive(active);
     Serial.print("Triggers -> ");
-    Serial.println(active ? "ON (ACTIVE LOW)" : "OFF (INACTIVE HIGH)");
+    Serial.println(active ? "ON (ACTIVE HIGH)" : "OFF (INACTIVE LOW)");
     return;
   }
 
@@ -286,7 +287,62 @@ static void setTriggerTargetsActive(const String& target, bool active) {
   Serial.print("Trigger ");
   Serial.print(id);
   Serial.print(" -> ");
-  Serial.println(active ? "ON (ACTIVE LOW)" : "OFF (INACTIVE HIGH)");
+  Serial.println(active ? "ON (ACTIVE HIGH)" : "OFF (INACTIVE LOW)");
+}
+
+static bool parseColorTokenToIndex(String token, uint8_t& outIdx) {
+  token.trim();
+  token.toLowerCase();
+  if (token == "red")      { outIdx = 0; return true; }
+  if (token == "ored")     { outIdx = 1; return true; }
+  if (token == "green")    { outIdx = 2; return true; }
+  if (token == "lgreen")   { outIdx = 3; return true; }
+  if (token == "blue")     { outIdx = 4; return true; }
+  if (token == "orange")   { outIdx = 5; return true; }
+  if (token == "oyellow")  { outIdx = 6; return true; }
+  if (token == "aqua")     { outIdx = 7; return true; }
+  if (token == "pink")     { outIdx = 9; return true; } // accepted but ignored (auto-appended on orb)
+  return false;
+}
+
+static bool packCycleList(const String& csv, int32_t& outPacked) {
+  // Packed format (6 colors max):
+  // bits 0..23: six 4-bit color indexes, in order
+  // bits 24..27: count
+  uint8_t idxs[6];
+  uint8_t count = 0;
+
+  int start = 0;
+  while (start < (int)csv.length()) {
+    int comma = csv.indexOf(',', start);
+    String tok = (comma < 0) ? csv.substring(start) : csv.substring(start, comma);
+    uint8_t idx = 0;
+    if (!parseColorTokenToIndex(tok, idx)) return false;
+    if (idx != 9) { // pink is auto-added by orb
+      if (count < 6) idxs[count++] = idx;
+    }
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+
+  if (count == 0) return false;
+
+  uint32_t packed = ((uint32_t)count & 0x0F) << 24;
+  for (uint8_t i = 0; i < count; i++) {
+    packed |= ((uint32_t)(idxs[i] & 0x0F) << (i * 4));
+  }
+  outPacked = (int32_t)packed;
+  return true;
+}
+
+static bool parseIrFuncToken(String token, int32_t& outCode) {
+  token.trim();
+  token.toLowerCase();
+  if (token == "on")     { outCode = 1; return true; }
+  if (token == "off")    { outCode = 2; return true; }
+  if (token == "flash")  { outCode = 3; return true; }
+  if (token == "strobe") { outCode = 4; return true; }
+  return false;
 }
 
 static void startConsensusHold() {
@@ -548,23 +604,23 @@ static String readLine() {
 
 static void printPinMap() {
   Serial.println();
-  Serial.println("=== TRIGGER PIN MAP (GPIO -> Header pin # from IMG_7712) ===");
+  Serial.println("=== TRIGGER PIN MAP (GPIO -> Header pin # from ESP32 pinout photo) ===");
   Serial.println("(Remember: code uses GPIO numbers, not header pin numbers.)");
-  Serial.println("Orb 1  -> GPIO13 (top pin 12)");
-  Serial.println("Orb 2  -> GPIO14 (top pin 10)");
-  Serial.println("Orb 3  -> GPIO16 (bottom pin 27)");
-  Serial.println("Orb 4  -> GPIO17 (bottom pin 28)");
-  Serial.println("Orb 5  -> GPIO18 (bottom pin 30)");
-  Serial.println("Orb 6  -> GPIO19 (bottom pin 32)");
-  Serial.println("Orb 7  -> GPIO21 (bottom pin 33)");
-  Serial.println("Orb 8  -> GPIO22 (bottom pin 36)");
-  Serial.println("Orb 9  -> GPIO23 (bottom pin 37)");
-  Serial.println("Orb 10 -> GPIO25 (top pin 7)");
-  Serial.println("Orb 11 -> GPIO26 (top pin 8)");
-  Serial.println("Orb 12 -> GPIO27 (top pin 9)");
-  Serial.println("Orb 13 -> GPIO32 (top pin 5)");
-  Serial.println("Orb 14 -> GPIO33 (top pin 6)");
-  Serial.println("ALL    -> GPIO4  (bottom pin 26)  [Active when ALL 14 last_color==TRIGGER_COLOR]");
+  Serial.println("Orb 1  -> GPIO13 (header pin 15)");
+  Serial.println("Orb 2  -> GPIO14 (header pin 12)");
+  Serial.println("Orb 3  -> GPIO16 (header pin 27)");
+  Serial.println("Orb 4  -> GPIO17 (header pin 28)");
+  Serial.println("Orb 5  -> GPIO18 (header pin 30)");
+  Serial.println("Orb 6  -> GPIO19 (header pin 31)");
+  Serial.println("Orb 7  -> GPIO21 (header pin 33)");
+  Serial.println("Orb 8  -> GPIO22 (header pin 36)");
+  Serial.println("Orb 9  -> GPIO23 (header pin 37)");
+  Serial.println("Orb 10 -> GPIO25 (header pin 9)");
+  Serial.println("Orb 11 -> GPIO26 (header pin 10)");
+  Serial.println("Orb 12 -> GPIO27 (header pin 11)");
+  Serial.println("Orb 13 -> GPIO32 (header pin 7)");
+  Serial.println("Orb 14 -> GPIO33 (header pin 8)");
+  Serial.println("ALL    -> GPIO4  (header pin 26)  [Active when ALL 14 last_color==TRIGGER_COLOR]");
   Serial.println();
 }
 
@@ -585,12 +641,16 @@ static void printHelp() {
   Serial.println("  set <id> <color 1-15>");
   Serial.println("  broadcast <color 1-15>");
   Serial.println("  on <id|all>");
+  Serial.println("  ir <id|all> <on|off|flash|strobe>");
   Serial.println("  trigger <on|off> <id|all>");
+  Serial.println("  cycle <id|all> <csv colors>");
+  Serial.println("    colors: red,ored,green,lgreen,blue,orange,oyellow,aqua[,pink]");
+  Serial.println("    pink is always auto-appended by orb");
   Serial.println("  (Hub sends MSG_CONSENSUS=1 when all 14 orbs report pink)");
   Serial.println();
   Serial.println("Pins:");
   Serial.println("  Orb1..Orb14 GPIOs: 13,14,16,17,18,19,21,22,23,25,26,27,32,33");
-  Serial.println("  (Use 'pins' to see the matching header pin numbers from IMG_7712.)");
+  Serial.println("  (Use 'pins' to see the matching header pin numbers from the ESP32 pinout photo.)");
   Serial.print("  ALL GPIO (all 14==TRIGGER_COLOR): ");
   Serial.println(ALL_ORBS_PIN);
   Serial.println();
@@ -615,7 +675,7 @@ static void listNodes() {
     Serial.print("  ");
     Serial.print(nodes[i].kv); // n{color:x}
     Serial.print(" pin=");
-    Serial.print(digitalRead(ORB_PINS[nodes[i].node_id]) == PIN_ACTIVE_LEVEL ? "ACTIVE(LOW)" : "INACTIVE(HIGH)");
+    Serial.print(digitalRead(ORB_PINS[nodes[i].node_id]) == PIN_ACTIVE_LEVEL ? "ACTIVE(HIGH)" : "INACTIVE(LOW)");
     Serial.print(" pending=");
     Serial.print(nodes[i].pending.active ? "yes" : "no");
     Serial.print(" pink=");
@@ -623,7 +683,7 @@ static void listNodes() {
   }
 
   Serial.print("ALL pin=");
-  Serial.println(digitalRead(ALL_ORBS_PIN) == PIN_ACTIVE_LEVEL ? "ACTIVE(LOW)" : "INACTIVE(HIGH)");
+  Serial.println(digitalRead(ALL_ORBS_PIN) == PIN_ACTIVE_LEVEL ? "ACTIVE(HIGH)" : "INACTIVE(LOW)");
   Serial.print("CONSENSUS(allPink)=");
   Serial.println(consensusAllPink ? "1" : "0");
   Serial.print("CONSENSUS_HOLD(active)=");
@@ -690,6 +750,35 @@ void loop() {
       int id = target.toInt();
       reliableSendToNode((uint8_t)id, MSG_IR_FUNC, 1);
     }
+  } else if (cmd.startsWith("ir ")) {
+    int sp1 = cmd.indexOf(' ', 3);
+    if (sp1 < 0) {
+      Serial.println("Usage: ir <id|all> <on|off|flash|strobe>");
+      return;
+    }
+    String target = cmd.substring(3, sp1);
+    String action = cmd.substring(sp1 + 1);
+    target.trim();
+    action.trim();
+    target.toLowerCase();
+    action.toLowerCase();
+
+    int32_t irCode = 0;
+    if (!parseIrFuncToken(action, irCode)) {
+      Serial.println("Usage: ir <id|all> <on|off|flash|strobe>");
+      return;
+    }
+
+    if (target == "all") {
+      reliableBroadcast(MSG_IR_FUNC, irCode);
+    } else {
+      int id = target.toInt();
+      if (id < 1 || id > 14) {
+        Serial.println("Usage: ir <id|all> <on|off|flash|strobe>");
+        return;
+      }
+      reliableSendToNode((uint8_t)id, MSG_IR_FUNC, irCode);
+    }
   } else if (cmd.startsWith("trigger ")) {
     int sp1 = cmd.indexOf(' ', 8);
     if (sp1 < 0) {
@@ -709,6 +798,34 @@ void loop() {
       setTriggerTargetsActive(target, false);
     } else {
       Serial.println("Usage: trigger <on|off> <id|all>");
+    }
+  } else if (cmd.startsWith("cycle ")) {
+    int sp1 = cmd.indexOf(' ', 6);
+    if (sp1 < 0) {
+      Serial.println("Usage: cycle <id|all> <csv colors>");
+      return;
+    }
+    String target = cmd.substring(6, sp1);
+    String csv = cmd.substring(sp1 + 1);
+    target.trim();
+    csv.trim();
+    target.toLowerCase();
+
+    int32_t packed = 0;
+    if (!packCycleList(csv, packed)) {
+      Serial.println("Invalid colors. Use: red,ored,green,lgreen,blue,orange,oyellow,aqua[,pink]");
+      return;
+    }
+
+    if (target == "all") {
+      reliableBroadcast(MSG_CYCLE_CFG, packed);
+    } else {
+      int id = target.toInt();
+      if (id < 1 || id > 14) {
+        Serial.println("Usage: cycle <id|all> <csv colors>");
+        return;
+      }
+      reliableSendToNode((uint8_t)id, MSG_CYCLE_CFG, packed);
     }
   } else {
     Serial.println("Unknown command. Type 'help'.");

@@ -44,7 +44,8 @@ enum MsgType : uint8_t {
   MSG_ACK       = 6,
   MSG_LIGHT     = 7,   // value = 1 if pink, 0 otherwise (ONLY on pink transitions)
   MSG_CONSENSUS = 8,   // value = 1 if all 14 orbs are pink, 0 otherwise
-  MSG_IR_FUNC   = 9    // value = 1:ON, 2:OFF, 3:FLASH, 4:STROBE
+  MSG_IR_FUNC   = 9,   // value = 1:ON, 2:OFF, 3:FLASH, 4:STROBE
+  MSG_CYCLE_CFG = 10   // value packed as: [count:4][idx0:4][idx1:4][idx2:4][idx3:4][idx4:4][idx5:4]
 };
 
 #pragma pack(push, 1)
@@ -103,22 +104,32 @@ static const LightColor LIGHT_FUNC[] = {
   {"STROBE", IR_ADDR, 0xF00F, false},
 };
 static const LightColor LIGHT_COLORS[] = {
-  {"RED",    IR_ADDR, 0xF30C, false},
+  {"RED",    IR_ADDR, 0xFB04, false},
+  {"ORED",   IR_ADDR, 0xF30C, false},
   {"GREEN",  IR_ADDR, 0xFA05, false},
+  {"LGREEN", IR_ADDR, 0xF609, false},
   {"BLUE",   IR_ADDR, 0xF906, false},
   {"ORANGE", IR_ADDR, 0xF708, false},
-  {"YELLOW", IR_ADDR, 0xEB14, false},
-  //{"AQUA",   IR_ADDR, 0xEE11, false},
-  {"PURPLE", IR_ADDR, 0xED12, false},
+  //{"YELLOW", IR_ADDR, 0xEB14, false},
+  {"OYELLOW", IR_ADDR, 0xEF10, false},
+  {"AQUA",   IR_ADDR, 0xEE11, false},
+  //{"PURPLE", IR_ADDR, 0xF10E, false},
+  //{"APURPLE", IR_ADDR, 0xED12, false},
   {"PINK",   IR_ADDR, 0xE916, true}
 };
- //alt yellow ef10
- //alt purpler ed12
- //alt red F30C
 static const uint8_t LIGHT_COLOR_COUNT = sizeof(LIGHT_COLORS) / sizeof(LIGHT_COLORS[0]);
+static const uint8_t PINK_LIGHT_INDEX = LIGHT_COLOR_COUNT - 1;
+static const uint8_t MAX_CYCLE_COLORS = 7; // up to 6 configured non-pink colors + PINK auto-appended
+static const uint32_t PINK_HOLD_MS = 3000;
 
-static uint8_t currentLightIndex = LIGHT_COLOR_COUNT - 1;
-static bool lastIsPink = true; // currentLightIndex starts at last color (PINK)
+// Default cycle is exactly 3 colors, then pink auto-appended:
+// RED, GREEN, BLUE, PINK
+static const uint8_t DEFAULT_CYCLE_NONPINK[3] = {0, 2, 4};
+
+static uint8_t colorsInUse[MAX_CYCLE_COLORS] = {0};
+static uint8_t colorsInUseCount = 0;
+static uint8_t currentCyclePos = 0; // index into colorsInUse[]
+static bool lastIsPink = true;
 
 // After a pink transition send, ignore taps for 2 seconds while listening for hub consensus
 static bool consensusListenActive = false;
@@ -127,6 +138,18 @@ static uint32_t tapLockoutUntilMs = 0;
 // STROBE override
 static bool strobeActive = false;
 static uint32_t strobeEndMs = 0;
+
+enum PinkPauseState : uint8_t {
+  PINK_PAUSE_IDLE = 0,
+  PINK_PAUSE_SEND_BEFORE,
+  PINK_PAUSE_HOLD,
+  PINK_PAUSE_SEND_AFTER
+};
+static PinkPauseState pinkPauseState = PINK_PAUSE_IDLE;
+static uint32_t pinkPauseUntilMs = 0;
+static uint8_t pinkBeforeSendsRemaining = 0;
+static uint8_t pinkAfterSendsRemaining = 0;
+static uint8_t queuedLightCount = 0;
 // ==================== IR SENDER (LEDC hardware 38kHz, NEC/NECext) ====================
 // Bit-banging at ~38kHz using digitalWrite can be too slow/inconsistent on some ESP32 variants
 // (especially when Wi-Fi/ESP-NOW is active). Use the LEDC hardware PWM for a stable carrier.
@@ -247,6 +270,11 @@ static int32_t lightQueuedValue = 0;
 
 // ==================== HELPERS ====================
 static bool reliableSendToHub(uint8_t type, int32_t value);
+static bool sendLightPulseToHub(bool isPink);
+static bool trySendLightPulseNow(bool isPink);
+static bool cycleIndexExists(uint8_t idx);
+static void applyCycleConfigPacked(uint32_t packed);
+static void initDefaultCycle();
 
 static void printMac(const uint8_t* mac) {
   for (int i = 0; i < 6; i++) {
@@ -337,16 +365,97 @@ static void sendAckTo(const uint8_t* mac, uint8_t ack_type, uint32_t ack_seq) {
 }
 
 static void sendLightStateToHub(bool isPink) {
-  int32_t v = isPink ? 1 : 0;
-  if (!reliableSendToHub(MSG_LIGHT, v)) {
-    lightQueued = true;
-    lightQueuedValue = v;
+  sendLightPulseToHub(isPink);
+}
+
+static bool cycleIndexExists(uint8_t idx) {
+  for (uint8_t i = 0; i < colorsInUseCount; i++) {
+    if (colorsInUse[i] == idx) return true;
   }
+  return false;
+}
+
+static void initDefaultCycle() {
+  colorsInUseCount = 0;
+  for (uint8_t i = 0; i < 3; i++) {
+    uint8_t idx = DEFAULT_CYCLE_NONPINK[i];
+    if (idx >= PINK_LIGHT_INDEX) continue;
+    colorsInUse[colorsInUseCount++] = idx;
+  }
+  colorsInUse[colorsInUseCount++] = PINK_LIGHT_INDEX;
+  currentCyclePos = colorsInUseCount - 1;
+  lastIsPink = true;
+  reportedColor = (int32_t)PINK_LIGHT_INDEX + 1;
+}
+
+static void applyCycleConfigPacked(uint32_t packed) {
+  uint8_t count = (uint8_t)((packed >> 24) & 0x0F);
+  if (count > 6) count = 6;
+
+  uint8_t newCycle[MAX_CYCLE_COLORS];
+  uint8_t newCount = 0;
+
+  for (uint8_t i = 0; i < count; i++) {
+    uint8_t idx = (uint8_t)((packed >> (i * 4)) & 0x0F);
+    if (idx >= PINK_LIGHT_INDEX) continue;
+    if (newCount > 0 && newCycle[newCount - 1] == idx) continue;
+    newCycle[newCount++] = idx;
+  }
+
+  // Keep at least one non-pink color.
+  if (newCount == 0) {
+    initDefaultCycle();
+    return;
+  }
+
+  for (uint8_t i = 0; i < newCount; i++) colorsInUse[i] = newCycle[i];
+  colorsInUseCount = newCount;
+  colorsInUse[colorsInUseCount++] = PINK_LIGHT_INDEX; // always force pink as last
+
+  if (!cycleIndexExists((uint8_t)(reportedColor - 1))) {
+    currentCyclePos = colorsInUseCount - 1; // reset to pink anchor
+    lastIsPink = true;
+    reportedColor = (int32_t)PINK_LIGHT_INDEX + 1;
+  } else {
+    for (uint8_t i = 0; i < colorsInUseCount; i++) {
+      if (colorsInUse[i] == (uint8_t)(reportedColor - 1)) {
+        currentCyclePos = i;
+        break;
+      }
+    }
+    lastIsPink = (colorsInUse[currentCyclePos] == PINK_LIGHT_INDEX);
+  }
+
+  Serial.print("Cycle updated (count=");
+  Serial.print(colorsInUseCount);
+  Serial.print("): ");
+  for (uint8_t i = 0; i < colorsInUseCount; i++) {
+    Serial.print(LIGHT_COLORS[colorsInUse[i]].name);
+    if (i + 1 < colorsInUseCount) Serial.print(",");
+  }
+  Serial.println();
+}
+
+static bool sendLightPulseToHub(bool isPink) {
+  int32_t v = isPink ? 1 : 0;
+  if (reliableSendToHub(MSG_LIGHT, v)) return true;
+  if (queuedLightCount < 10) queuedLightCount++;
+  lightQueued = true;
+  lightQueuedValue = v;
+  return false;
+}
+
+static bool trySendLightPulseNow(bool isPink) {
+  int32_t v = isPink ? 1 : 0;
+  return reliableSendToHub(MSG_LIGHT, v);
 }
 static void startConsensusListenWindow() {
   consensusListenActive = true;
-  tapLockoutUntilMs = millis() + 2000UL; // 2 seconds
-  Serial.println("Consensus listen started (tap lockout 2000ms)");
+  uint32_t candidate = millis() + 2000UL; // minimum lockout while waiting for consensus
+  if ((int32_t)(tapLockoutUntilMs - candidate) < 0) {
+    tapLockoutUntilMs = candidate; // only extend, never shorten an existing lockout
+  }
+  Serial.println("Consensus listen started (tap lockout >=2000ms)");
 }
 
 static void sendStrobeFor3Minutes() {
@@ -365,7 +474,8 @@ static void sendStrobeFor3Minutes() {
 }
 
 static void resendCurrentColorIR() {
-  const LightColor& lc = LIGHT_COLORS[currentLightIndex];
+  uint8_t idx = colorsInUse[currentCyclePos];
+  const LightColor& lc = LIGHT_COLORS[idx];
   Serial.print("STROBE end -> restore color: ");
   Serial.println(lc.name);
   for (int i = 0; i < 3; i++) {
@@ -387,13 +497,19 @@ static void sendIrFunctionByCode(int32_t code) {
 }
 
 static void sendNextLightColor() {
-  // Advance to next predefined color
-  currentLightIndex = (uint8_t)((currentLightIndex + 1) % LIGHT_COLOR_COUNT);
-  const LightColor& lc = LIGHT_COLORS[currentLightIndex];
+  if (colorsInUseCount == 0) return;
+  if (pinkPauseState != PINK_PAUSE_IDLE) {
+    Serial.println("Tap ignored: pink hold active");
+    return;
+  }
+
+  currentCyclePos = (uint8_t)((currentCyclePos + 1) % colorsInUseCount);
+  uint8_t colorIdx = colorsInUse[currentCyclePos];
+  const LightColor& lc = LIGHT_COLORS[colorIdx];
 
   // Map the chosen color to a 1..15 value for the hub (use index+1 for now)
   // If the hub expects a different mapping, adjust here.
-  reportedColor = (int32_t)currentLightIndex + 1;
+  reportedColor = (int32_t)colorIdx + 1;
 
   Serial.print("Color selected -> ");
   Serial.print(lc.name);
@@ -424,13 +540,58 @@ static void sendNextLightColor() {
   if (lc.isPink != lastIsPink) {
     lastIsPink = lc.isPink;
 
-    int32_t v = lc.isPink ? 1 : 0;
-    if (reliableSendToHub(MSG_LIGHT, v)) {
+    if (lc.isPink) {
+      // Requirement:
+      // 1) send pink active twice BEFORE pause
+      // 2) hold 3 seconds
+      // 3) send pink active twice AFTER pause
+      pinkBeforeSendsRemaining = 2;
+      pinkAfterSendsRemaining = 2;
+      pinkPauseState = PINK_PAUSE_SEND_BEFORE;
+      tapLockoutUntilMs = millis() + PINK_HOLD_MS;
       startConsensusListenWindow();
     } else {
-      // Queue it; when it finally sends in loop(), we will start the listen window then.
-      lightQueued = true;
-      lightQueuedValue = v;
+      sendLightPulseToHub(false);
+      consensusListenActive = false;
+    }
+  }
+}
+
+static void pinkPauseTick() {
+  if (pinkPauseState == PINK_PAUSE_IDLE) return;
+
+  if (pinkPauseState == PINK_PAUSE_SEND_BEFORE) {
+    if (pinkBeforeSendsRemaining == 0) {
+      pinkPauseUntilMs = millis() + PINK_HOLD_MS;
+      pinkPauseState = PINK_PAUSE_HOLD;
+      Serial.println("Pink hold started (3000ms)");
+      return;
+    }
+    if (!pending.active && trySendLightPulseNow(true)) {
+      pinkBeforeSendsRemaining--;
+      Serial.print("Pink pre-hold send remaining=");
+      Serial.println(pinkBeforeSendsRemaining);
+    }
+    return;
+  }
+
+  if (pinkPauseState == PINK_PAUSE_HOLD) {
+    if ((int32_t)(millis() - pinkPauseUntilMs) < 0) return;
+    pinkPauseState = PINK_PAUSE_SEND_AFTER;
+    Serial.println("Pink hold ended; sending post-hold pink pulses");
+    return;
+  }
+
+  if (pinkPauseState == PINK_PAUSE_SEND_AFTER) {
+    if (pinkAfterSendsRemaining == 0) {
+      pinkPauseState = PINK_PAUSE_IDLE;
+      Serial.println("Pink pause sequence complete");
+      return;
+    }
+    if (!pending.active && trySendLightPulseNow(true)) {
+      pinkAfterSendsRemaining--;
+      Serial.print("Pink post-hold send remaining=");
+      Serial.println(pinkAfterSendsRemaining);
     }
   }
 }
@@ -562,6 +723,8 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
     reliableSendToHub(MSG_STATUS, reportedColor);
   } else if (p.type == MSG_IR_FUNC) {
     sendIrFunctionByCode(p.value);
+  } else if (p.type == MSG_CYCLE_CFG) {
+    applyCycleConfigPacked((uint32_t)p.value);
   } else if (p.type == MSG_CONSENSUS) {
     // Hub tells us if all 14 orbs are pink.
     if (consensusListenActive && !strobeActive && p.value == 1) {
@@ -613,7 +776,7 @@ static void handleVibration() {
 
             // Enforce 2s delay after the pink transition send:
             // during lockout we keep listening for hub replies, but ignore user taps.
-            if (!strobeActive && now >= tapLockoutUntilMs) {
+            if (!strobeActive && pinkPauseState == PINK_PAUSE_IDLE && now >= tapLockoutUntilMs) {
               // Any valid tap ends the consensus listening phase.
               consensusListenActive = false;
 
@@ -662,6 +825,8 @@ digitalWrite(PIN_IR_LED, LOW);
 // Now attach LEDC and run the carrier self-test (printed inside irInitLedc())
 irInitLedc();
 
+  initDefaultCycle();
+
   // Optional boot test: sends one IR command so you can confirm the receiver reacts.
   // This is OFF by default to avoid changing behavior unexpectedly.
   if (IR_TEST_ON_BOOT) {
@@ -697,6 +862,7 @@ irInitLedc();
 
 void loop() {
   retryTick();
+  pinkPauseTick();
   handleVibration();
   uint32_t now = millis();
 
@@ -733,10 +899,10 @@ void loop() {
     Serial.println("loop alive");
   }
 
-  if (hubKnown && lightQueued && !pending.active) {
+  if (hubKnown && lightQueued && !pending.active && queuedLightCount > 0) {
     if (reliableSendToHub(MSG_LIGHT, lightQueuedValue)) {
-      lightQueued = false;
-      startConsensusListenWindow();
+      queuedLightCount--;
+      if (queuedLightCount == 0) lightQueued = false;
     }
   }
 
