@@ -6,7 +6,7 @@
 #include "esp_system.h"
 
 // ==================== CONFIG ====================
-#define NODE_ID 2                // CHANGE per orb: 1..14
+#define NODE_ID 11                // CHANGE per orb: 1..14
 static const uint8_t CHANNEL = 1; // MUST MATCH HUB
 // IR output + Vibration input
 // If your hardware is wired to different GPIOs, change the values here.
@@ -131,13 +131,10 @@ static uint8_t colorsInUseCount = 0;
 static uint8_t currentCyclePos = 0; // index into colorsInUse[]
 static bool lastIsPink = true;
 
-// After a pink transition send, ignore taps for 2 seconds while listening for hub consensus
-static bool consensusListenActive = false;
-static uint32_t tapLockoutUntilMs = 0;
-
 // STROBE override
 static bool strobeActive = false;
 static uint32_t strobeEndMs = 0;
+static int32_t serverConsensusCmd = 0; // server-driven consensus command (0 idle, 1 trigger strobe)
 
 enum PinkPauseState : uint8_t {
   PINK_PAUSE_IDLE = 0,
@@ -449,15 +446,6 @@ static bool trySendLightPulseNow(bool isPink) {
   int32_t v = isPink ? 1 : 0;
   return reliableSendToHub(MSG_LIGHT, v);
 }
-static void startConsensusListenWindow() {
-  consensusListenActive = true;
-  uint32_t candidate = millis() + 2000UL; // minimum lockout while waiting for consensus
-  if ((int32_t)(tapLockoutUntilMs - candidate) < 0) {
-    tapLockoutUntilMs = candidate; // only extend, never shorten an existing lockout
-  }
-  Serial.println("Consensus listen started (tap lockout >=2000ms)");
-}
-
 static void sendStrobeFor3Minutes() {
   const LightColor& fn = LIGHT_FUNC[3]; // STROBE
   Serial.println("CONSENSUS reached -> STROBE for 3 minutes");
@@ -548,11 +536,8 @@ static void sendNextLightColor() {
       pinkBeforeSendsRemaining = 2;
       pinkAfterSendsRemaining = 2;
       pinkPauseState = PINK_PAUSE_SEND_BEFORE;
-      tapLockoutUntilMs = millis() + PINK_HOLD_MS;
-      startConsensusListenWindow();
     } else {
       sendLightPulseToHub(false);
-      consensusListenActive = false;
     }
   }
 }
@@ -567,11 +552,13 @@ static void pinkPauseTick() {
       Serial.println("Pink hold started (3000ms)");
       return;
     }
-    if (!pending.active && trySendLightPulseNow(true)) {
-      pinkBeforeSendsRemaining--;
-      Serial.print("Pink pre-hold send remaining=");
-      Serial.println(pinkBeforeSendsRemaining);
+    // Always consume two pre-hold send attempts so hold timing never stretches.
+    if (!pending.active) {
+      (void)trySendLightPulseNow(true);
     }
+    pinkBeforeSendsRemaining--;
+    Serial.print("Pink pre-hold send remaining=");
+    Serial.println(pinkBeforeSendsRemaining);
     return;
   }
 
@@ -588,11 +575,13 @@ static void pinkPauseTick() {
       Serial.println("Pink pause sequence complete");
       return;
     }
-    if (!pending.active && trySendLightPulseNow(true)) {
-      pinkAfterSendsRemaining--;
-      Serial.print("Pink post-hold send remaining=");
-      Serial.println(pinkAfterSendsRemaining);
+    // Always consume two post-hold send attempts so lock duration stays 3 seconds.
+    if (!pending.active) {
+      (void)trySendLightPulseNow(true);
     }
+    pinkAfterSendsRemaining--;
+    Serial.print("Pink post-hold send remaining=");
+    Serial.println(pinkAfterSendsRemaining);
   }
 }
 
@@ -726,10 +715,13 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   } else if (p.type == MSG_CYCLE_CFG) {
     applyCycleConfigPacked((uint32_t)p.value);
   } else if (p.type == MSG_CONSENSUS) {
-    // Hub tells us if all 14 orbs are pink.
-    if (consensusListenActive && !strobeActive && p.value == 1) {
-      consensusListenActive = false; // stop waiting once consensus is reached
+    // Server is the source of truth for consensus.
+    // Keep local state at 0 unless server explicitly sends 1.
+    serverConsensusCmd = (p.value == 1) ? 1 : 0;
+    if (serverConsensusCmd == 1 && !strobeActive) {
       sendStrobeFor3Minutes();
+      // One-shot trigger; return to idle until server sends a new command.
+      serverConsensusCmd = 0;
     }
   }
 }
@@ -774,17 +766,12 @@ static void handleVibration() {
 
             if (now - lastTapMs >= TAP_COOLDOWN_MS) {
 
-            // Enforce 2s delay after the pink transition send:
-            // during lockout we keep listening for hub replies, but ignore user taps.
-            if (!strobeActive && pinkPauseState == PINK_PAUSE_IDLE && now >= tapLockoutUntilMs) {
-              // Any valid tap ends the consensus listening phase.
-              consensusListenActive = false;
-
+            if (!strobeActive && pinkPauseState == PINK_PAUSE_IDLE) {
               sendNextLightColor();
               lastTapMs = now;
             } else {
               if (strobeActive) Serial.println("Tap ignored: STROBE active");
-              else Serial.println("Tap ignored: consensus lockout active");
+              else Serial.println("Tap ignored: pink hold active");
             }
           }
       }

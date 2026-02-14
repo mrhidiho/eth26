@@ -47,12 +47,12 @@ static const int ORB_PINS[15] = {
   33         // Orb 14 -> GPIO33 (header pin 8)
 };
 
-// "ALL ORBS == 15" pin (GPIO number):
+// "ALL ORBS == TRIGGER_COLOR" pin (GPIO number):
 // Active when all 14 nodes report last_color == TRIGGER_COLOR.
 static const int ALL_ORBS_PIN = 4; // GPIO4 (header pin 26)
 
-// Trigger color
-static const int32_t TRIGGER_COLOR = 15;
+// Trigger color (orb reports PINK as 9 in current Orb firmware)
+static const int32_t TRIGGER_COLOR = 9;
 
 // Outputs are active-high: HIGH = active, LOW = inactive
 static const uint8_t PIN_ACTIVE_LEVEL = HIGH;
@@ -376,7 +376,7 @@ static void updatePinsForOrb(uint8_t node_id, int32_t color) {
 
 static void updateAllOrbsPin() {
   if (consensusHoldActive) return; // hold overrides "ALL" writes
-  // "ALL" output is active only if all 14 nodes last_color == 15
+  // "ALL" output is active only if all 14 nodes last_color == TRIGGER_COLOR
   bool all15 = true;
 
   for (int n = 1; n <= 14; n++) {
